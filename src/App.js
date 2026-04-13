@@ -97,9 +97,9 @@ const generateActivityBadges = () => {
 };
 
 const SPECIAL_BADGES = [
-  { id: "water_3d", emoji: "💧", title: "Hydratée", desc: "Objectif eau 3 jours", condition: (s) => (s.waterDays || 0) >= 3, tier: "Bronze", tierEmoji: "🥉" },
-  { id: "water_7d", emoji: "💧", title: "Hydra Queen", desc: "Objectif eau 7 jours", condition: (s) => (s.waterDays || 0) >= 7, tier: "Argent", tierEmoji: "🥈" },
-  { id: "water_30d", emoji: "💧", title: "Aqua Goddess", desc: "Objectif eau 30 jours", condition: (s) => (s.waterDays || 0) >= 30, tier: "Or", tierEmoji: "🥇" },
+  { id: "water_3d", emoji: "💧", title: "Hydratée", desc: "Objectif eau 3 jours consécutifs", condition: (s) => getWaterStreak(s.waterGoalDates || []) >= 3, tier: "Bronze", tierEmoji: "🥉" },
+  { id: "water_7d", emoji: "💧", title: "Hydra Queen", desc: "Objectif eau 7 jours consécutifs", condition: (s) => getWaterStreak(s.waterGoalDates || []) >= 7, tier: "Argent", tierEmoji: "🥈" },
+  { id: "water_30d", emoji: "💧", title: "Aqua Goddess", desc: "Objectif eau 30 jours consécutifs", condition: (s) => getWaterStreak(s.waterGoalDates || []) >= 30, tier: "Or", tierEmoji: "🥇" },
   { id: "tasks_10", emoji: "✅", title: "Productrice", desc: "10 tâches complétées", condition: (s) => (s.tasksCompleted || 0) >= 10, tier: "Bronze", tierEmoji: "🥉" },
   { id: "tasks_50", emoji: "✅", title: "Machine", desc: "50 tâches complétées", condition: (s) => (s.tasksCompleted || 0) >= 50, tier: "Argent", tierEmoji: "🥈" },
   { id: "tasks_100", emoji: "✅", title: "Superstar", desc: "100 tâches complétées", condition: (s) => (s.tasksCompleted || 0) >= 100, tier: "Or", tierEmoji: "🥇" },
@@ -137,6 +137,19 @@ const MOTIVATIONAL_MESSAGES = [
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 const getToday = () => new Date().toISOString().split("T")[0];
+
+// Returns the longest consecutive-day streak from an array of date strings "YYYY-MM-DD"
+const getWaterStreak = (goalDates) => {
+  if (!goalDates || goalDates.length === 0) return 0;
+  const unique = [...new Set(goalDates)].sort();
+  let maxStreak = 1, cur = 1;
+  for (let i = 1; i < unique.length; i++) {
+    const diff = Math.round((new Date(unique[i]) - new Date(unique[i - 1])) / 86400000);
+    if (diff === 1) { cur++; if (cur > maxStreak) maxStreak = cur; }
+    else if (diff > 1) cur = 1;
+  }
+  return maxStreak;
+};
 const formatTime = (s) => {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -268,13 +281,28 @@ export default function MorganeApp() {
   const [stats, setStats] = useState(() => load("mg_stats", {}));
   const [badges, setBadges] = useState(() => load("mg_badges", []));
   const [newBadge, setNewBadge] = useState(null);
-  const [funFact] = useState(() => {
+  const [funFact, setFunFact] = useState(() => {
     const saved = load("mg_funfact", null);
     if (saved && saved.date === getToday()) return saved.fact;
     const fact = FUN_FACTS[Math.floor(Math.random() * FUN_FACTS.length)];
     save("mg_funfact", { fact, date: getToday() });
     return fact;
   });
+
+  // Load extended fun-facts from JSON (replaces hardcoded list if today's fact not yet set)
+  useEffect(() => {
+    const saved = load("mg_funfact", null);
+    if (saved && saved.date === getToday()) return;
+    fetch("/fun-facts.json")
+      .then(r => r.json())
+      .then(facts => {
+        if (!Array.isArray(facts) || facts.length === 0) return;
+        const fact = facts[Math.floor(Math.random() * facts.length)];
+        setFunFact(fact);
+        save("mg_funfact", { fact, date: getToday() });
+      })
+      .catch(() => {});
+  }, []);
   const [newTask, setNewTask] = useState("");
   const [calMonth, setCalMonth] = useState(new Date().getMonth());
   const [calYear, setCalYear] = useState(new Date().getFullYear());
@@ -308,7 +336,12 @@ export default function MorganeApp() {
     }
     if (water.date !== today) {
       if (water.amount >= WATER_GOAL) {
-        setStats(s => { const n = { ...s, waterDays: (s.waterDays || 0) + 1 }; save("mg_stats", n); return n; });
+        setStats(s => {
+          const dates = s.waterGoalDates || [];
+          if (dates.includes(water.date)) return s;
+          const n = { ...s, waterGoalDates: [...dates, water.date] };
+          save("mg_stats", n); return n;
+        });
       }
       setWater(() => { const nw = { amount: 0, date: today }; save("mg_water", nw); return nw; });
     }
@@ -320,14 +353,22 @@ export default function MorganeApp() {
     });
   }, []);
 
-  // Timer with recovery
+  // Timer with recovery — recalculates from timestamp to stay accurate when backgrounded
   useEffect(() => {
     if (timerRunning && timerStartedAt) {
-      const elapsed = Math.floor((Date.now() - timerStartedAt) / 1000);
-      setTimerSeconds(elapsed);
-      timerRef.current = setInterval(() => {
-        setTimerSeconds(prev => { const n = prev + 1; save("mg_timer_seconds", n); return n; });
-      }, 1000);
+      const recalc = () => {
+        const elapsed = Math.floor((Date.now() - timerStartedAt) / 1000);
+        setTimerSeconds(elapsed);
+        save("mg_timer_seconds", elapsed);
+      };
+      recalc();
+      timerRef.current = setInterval(recalc, 1000);
+      const handleVisibility = () => { if (!document.hidden) recalc(); };
+      document.addEventListener("visibilitychange", handleVisibility);
+      return () => {
+        clearInterval(timerRef.current);
+        document.removeEventListener("visibilitychange", handleVisibility);
+      };
     }
     return () => clearInterval(timerRef.current);
   }, [timerRunning, timerStartedAt]);
@@ -458,8 +499,15 @@ export default function MorganeApp() {
   const addWater = () => {
     const nw = { ...water, amount: Math.min(water.amount + WATER_STEP, 4000) };
     setWater(nw); save("mg_water", nw);
+    // Record this date only once, only when crossing the goal threshold
     if (nw.amount >= WATER_GOAL && water.amount < WATER_GOAL) {
-      setStats(s => { const n = { ...s, waterDays: (s.waterDays || 0) + 1 }; save("mg_stats", n); return n; });
+      setStats(s => {
+        const today = getToday();
+        const dates = s.waterGoalDates || [];
+        if (dates.includes(today)) return s;
+        const n = { ...s, waterGoalDates: [...dates, today] };
+        save("mg_stats", n); return n;
+      });
     }
   };
 
@@ -733,7 +781,7 @@ export default function MorganeApp() {
                 <div style={{ fontSize: "10px", color: "#8E8EA0" }}>activités</div>
               </div>
               <div>
-                <div style={{ fontSize: "22px", fontWeight: 700, color: "#0089BA" }}>{stats.waterDays || 0}j</div>
+                <div style={{ fontSize: "22px", fontWeight: 700, color: "#0089BA" }}>{getWaterStreak(stats.waterGoalDates || [])}j</div>
                 <div style={{ fontSize: "10px", color: "#8E8EA0" }}>eau ok</div>
               </div>
             </div>
@@ -1065,3 +1113,4 @@ export default function MorganeApp() {
     </div>
   );
 }
+
